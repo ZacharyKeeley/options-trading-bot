@@ -4,6 +4,7 @@ Modular Python bot for backtesting and running options strategies with broker‑
 
 ## Install
 bash
+
 git clone https://github.com/ZacharyKeeley/options-trading-bot.git
 
 cd options-trading-bot/options_trading_bot
