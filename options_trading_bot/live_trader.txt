@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+
+import time
+import signal
+import logging
+import pytz
+from types import SimpleNamespace
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.exceptions import HTTPError
+from sklearn.ensemble import RandomForestClassifier
+
+from alpaca_trade_api.rest import REST, APIError
+
+from data_fetcher import fetch_bars, get_last_quote
+from features import add_features
+
+
+logger = logging.getLogger("OptionsBot.LiveTrader")
+
+
+def in_live_hours(now: datetime, cfg) -> bool:
+    return cfg.market_open <= now.time() <= cfg.market_close
+
+
+class LiveTrader:
+    def __init__(self, trading_api: REST, options_api: REST, cfg):
+        self.trading_api = trading_api
+
+        # build a dedicated “options‐data” client
+        # v1beta1 is the only options endpoint currently in paper
+        self.options_data_api = REST(
+            key_id     = trading_api._key_id,
+            secret_key = trading_api._secret_key,
+            base_url   = "https://data.alpaca.markets/v1beta1",
+        )
+        # copy headers from trading client so auth is sent
+        self.options_data_api._session.headers.update(
+           trading_api._session.headers
+        )
+
+
+        # use the same REST client for option‐chain calls
+        self.options_api = options_api
+
+        self.cfg        = cfg
+        self.models     = {}
+        self.last_train = datetime.min.replace(tzinfo=pytz.UTC)
+        self.open_opts  = {}
+        self._running   = False
+
+        # defaults
+        self.cfg.test_size        = getattr(self.cfg, "test_size",   0.2)
+        self.cfg.min_samples      = getattr(self.cfg, "min_samples", 5)
+        self.cfg.horizon          = getattr(self.cfg, "horizon",     1)
+        self.cfg.retrain_interval = getattr(self.cfg, "retrain_interval", 3600)
+        self.cfg.refresh_seconds  = getattr(self.cfg, "refresh_seconds",  60)
+        self.cfg.eastern          = getattr(self.cfg, "eastern",
+                                            pytz.timezone("US/Eastern"))
+        # required config:
+        #  .symbols: List[str]
+        #  .lookback_min: int
+        #  .market_open, .market_close: time
+        #  .model_params: dict
+
+    def refresh_positions(self):
+        self.open_opts.clear()
+        try:
+            if hasattr(self.trading_api, "get_all_positions"):
+                positions = self.trading_api.get_all_positions()
+            else:
+                positions = self.trading_api.list_positions()
+
+            for p in positions:
+                if getattr(p, "asset_class", None) == "option":
+                    self.open_opts[p.symbol] = float(p.avg_entry_price)
+
+        except APIError as e:
+            logger.warning(f"APIError refreshing positions: {e}")
+        except Exception:
+            logger.exception("Failed to refresh positions")
+
+    def pick_atm(self, symbol: str, direction: bool):
+        session = self.options_data_api._session
+        chains_ep = f"{self.options_data_api._base_url}/options/chains"
+
+        def fetch_with_backoff(params):
+            backoff = 1
+            for attempt in range(3):
+                r = session.get(chains_ep, params=params)
+                if r.status_code == 429:
+                    logger.warning(
+                        f"Rate-limited on {symbol} (retry {attempt+1}), backing off {backoff}s"
+                    )
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                return r
+            return None
+
+        try:
+            # STEP 1: pull all strikes
+            r = fetch_with_backoff({
+                "underlying_symbol": symbol,
+                "expiration_days":   7,
+                "limit":             50,
+            })
+
+            # nothing worked or forbidden/non-existent
+            code = getattr(r, "status_code", None)
+            if not r or code in (403, 404, 429):
+                logger.warning(
+                    f"Options unavailable for {symbol} (status {code}), skipping."
+                )
+                return None
+            r.raise_for_status()
+            chains = r.json()["chains"]
+
+            # STEP 2: pick ATM strike
+            strikes    = [c["strike_price"] for c in chains]
+            spot       = get_last_quote(symbol).askprice
+            atm_strike = min(strikes, key=lambda s: abs(s - spot))
+            opt_type   = "call" if direction else "put"
+
+            # STEP 3: re-fetch only that strike/type
+            r2 = fetch_with_backoff({
+                "underlying_symbol": symbol,
+                "expiration_days":   7,
+                "limit":             50,
+                "strike_price":      atm_strike,
+                "option_type":       opt_type,
+            })
+            if not r2:
+                logger.warning(f"Final retry failed for {symbol}; skipping.")
+                return None
+            r2.raise_for_status()
+            legs = r2.json()["chains"]
+
+            # STEP 4: nearest expiration
+            best = min(
+                legs,
+                key=lambda o: datetime.fromisoformat(o["expiration_date"])
+            )
+            return SimpleNamespace(
+                symbol          = best["symbol"],
+                ask_price       = best.get("ask_price", best.get("ask")),
+                expiration_date = datetime.fromisoformat(best["expiration_date"]),
+            )
+
+        except Exception:
+            logger.exception(f"Failed to pick ATM for {symbol}")
+            return None
+
+
+    def train_models(self):
+        logger.info("Retraining models...")
+        with ThreadPoolExecutor(max_workers=len(self.cfg.symbols)) as exe:
+            futures = {exe.submit(self._train_one, s): s for s in self.cfg.symbols}
+            for fut in as_completed(futures):
+                sym = futures[fut]
+                try:
+                    m = fut.result()
+                    if m:
+                        self.models[sym] = m
+                        logger.info(f"Trained model for {sym}")
+                except Exception:
+                    logger.exception(f"Error training model for {sym}")
+
+        self.last_train = datetime.now(self.cfg.eastern)
+
+    def _train_one(self, symbol: str):
+        try:
+            df = fetch_bars(symbol, self.cfg.lookback_min)
+        except HTTPError as e:
+            if e.response.status_code == 403:
+                logger.warning(f"Forbidden fetching history for {symbol}")
+                return None
+            raise
+
+        if df.empty:
+            logger.warning(f"No data for {symbol}")
+            return None
+
+        df_feat = add_features(df)
+        future_ret = df_feat["close"].shift(-self.cfg.horizon) / df_feat["close"] - 1
+        df_feat["label"] = (future_ret > 0).astype(int)
+        df_feat.dropna(subset=["label"], inplace=True)
+
+        pos = df_feat[df_feat["label"] == 1]
+        neg = df_feat[df_feat["label"] == 0]
+        if len(pos) < self.cfg.min_samples or len(neg) < self.cfg.min_samples:
+            logger.warning(
+                f"Not enough samples for {symbol}: {len(pos)}+, {len(neg)}-"
+            )
+            return None
+
+        X = df_feat.drop(columns=["label"])
+        y = df_feat["label"]
+        model = RandomForestClassifier(**self.cfg.model_params)
+        model.fit(X, y)
+        return model
+
+    def run(self):
+        signal.signal(signal.SIGINT,  lambda s,f: setattr(self, "_running", False))
+        signal.signal(signal.SIGTERM, lambda s,f: setattr(self, "_running", False))
+        self._running = True
+
+        self.train_models()
+        self.refresh_positions()
+        logger.info("Entering live trading loop.")
+
+        while self._running:
+            now = datetime.now(self.cfg.eastern)
+
+            if not in_live_hours(now, self.cfg):
+                next_open = datetime.combine(
+                    now.date(), self.cfg.market_open, tzinfo=self.cfg.eastern
+                )
+                if now.time() > self.cfg.market_close:
+                    next_open += timedelta(days=1)
+                sleep_secs = max((next_open - now).total_seconds(), 60)
+                logger.info(f"Market closed; sleeping {sleep_secs/60:.1f}m")
+                time.sleep(sleep_secs)
+                continue
+
+            if (now - self.last_train).total_seconds() >= self.cfg.retrain_interval:
+                self.train_models()
+                self.refresh_positions()
+
+            for sym, model in self.models.items():
+                try:
+                    df_hist = fetch_bars(sym, self.cfg.lookback_min)
+                except HTTPError as e:
+                    if e.response.status_code == 403:
+                        logger.warning(f"Forbidden fetching live bars for {sym}")
+                        continue
+                    raise
+
+                if df_hist.empty:
+                    logger.warning(f"No recent bars for {sym}")
+                    continue
+
+                feat = add_features(df_hist).tail(1).drop(columns=["label"], errors="ignore")
+                try:
+                    sig = model.predict(feat)[0]
+                except Exception:
+                    logger.exception(f"Prediction failed for {sym}")
+                    continue
+
+                has_pos   = sym in self.open_opts
+                direction = bool(sig)
+
+                if not has_pos:
+                    opt = self.pick_atm(sym, direction)
+                    if opt:
+                        try:
+                            self.trading_api.submit_order(
+                                symbol        = opt.symbol,
+                                qty           = 1,
+                                side          = "buy",
+                                time_in_force = "gtc",
+                                order_class   = "market",
+                            )
+                            logger.info(
+                                f"{'Opened LONG' if direction else 'Opened SHORT'} {opt.symbol}"
+                            )
+                            self.open_opts[sym] = opt.ask_price
+                        except Exception:
+                            logger.exception(f"Failed to open {opt.symbol}")
+
+                elif direction != (self.open_opts[sym] > 0):
+                    try:
+                        self.trading_api.submit_order(
+                            symbol        = sym,
+                            qty           = 1,
+                            side          = "sell",
+                            time_in_force = "gtc",
+                            order_class   = "market",
+                        )
+                        logger.info(f"Closed position {sym}")
+                        self.open_opts.pop(sym, None)
+                    except Exception:
+                        logger.exception(f"Failed to close {sym}")
+
+            time.sleep(self.cfg.refresh_seconds)
+
+        logger.info("LiveTrader has shut down.")

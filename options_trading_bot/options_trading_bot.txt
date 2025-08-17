@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""
+Live‐Paper Options Trading Bot for 50 Tech Stocks Using Random Forests
+Single file with both backtest and live‐paper trading modes.
+"""
+
+import os
+import logging
+import argparse
+import time
+import signal
+
+from datetime import datetime, time as dtime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pandas as pd
+import numpy as np
+import pytz
+import backoff
+from scipy.stats import norm
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+
+from alpaca_trade_api.rest import REST, TimeFrame
+
+# -----------------------------------------------------------------------------
+# CONFIG & LOGGER
+# -----------------------------------------------------------------------------
+logger = logging.getLogger("OptionsBot")
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO
+)
+
+class Config:
+    """Holds global parameters."""
+    api_key: str
+    api_secret: str
+    base_url: str    = "https://paper-api.alpaca.markets"
+    data_feed: str  = "iex"
+    symbols: list   = [
+        "AAPL","MSFT","GOOGL","AMZN","META","TSLA","NVDA","AMD","INTC","IBM",
+        "ORCL","CRM","ADP","SNOW","NFLX","SPOT","EBAY","ZM","DOCU","PYPL",
+        "OKTA","PANW","SHOP","UBER","LYFT","MELI","PINS","FTNT","TTD",
+        "ZS","DDOG","WDAY","SNPS","MRVL","AVGO","CSCO","QCOM","DELL","HPQ",
+        "INTU","ADBE","NOW","TEAM","CRWD","NET","LRCX","MU","ASML"
+    ]
+    features: list   = ["ret","sma5","sma10","rsi14"]
+    model_params: dict = {"n_estimators":100,"max_depth":5,"random_state":42}
+    r: float        = 0.01
+    sigma: float    = 0.30
+    eastern         = pytz.timezone("US/Eastern")
+    market_open     = dtime(9,30)
+    market_close    = dtime(16,0)
+    lookback_min    = 120    # minutes of bars for live training
+    retrain_min     = 60     # retrain every 60 minutes
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["backtest","live"], default="backtest",
+                   help="backtest or live‐paper trading")
+    p.add_argument("--lookback_days", type=int, default=120,
+                   help="Days of history for backtest (60 days ⇒ 60*390 mins)")
+    p.add_argument("--test_size", type=float, default=0.2,
+                   help="Fraction for test split in backtest")
+    p.add_argument("--workers", type=int, default=8,
+                   help="Parallel workers for backtesting")
+    p.add_argument("--start_capital", type=float, default=50000.0,
+                   help="Starting capital for backtest")
+    p.add_argument("--out", type=str, default="output",
+                   help="Directory to save backtest results")
+    return p.parse_args()
+
+# -----------------------------------------------------------------------------
+# UTILITIES
+# -----------------------------------------------------------------------------
+def to_iso_utc(dt: datetime) -> str:
+    return dt.astimezone(pytz.utc).isoformat()
+
+def in_live_hours(cfg: Config) -> bool:
+    now = datetime.now(cfg.eastern).time()
+    return cfg.market_open <= now <= cfg.market_close
+
+@backoff.on_exception(backoff.expo, Exception, max_time=30, jitter=backoff.full_jitter)
+def fetch_bars(api: REST, sym: str, minutes: int, cfg: Config) -> pd.DataFrame:
+    end   = datetime.now(cfg.eastern)
+    start = end - timedelta(minutes=minutes)
+    df = api.get_bars(
+        sym, TimeFrame.Minute,
+        start=to_iso_utc(start), end=to_iso_utc(end),
+        limit=minutes+5, feed=cfg.data_feed
+    ).df
+
+    idx = pd.to_datetime(df.index)
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    elif idx.tz != pytz.UTC:
+        idx = idx.tz_convert("UTC")
+    idx = idx.tz_convert(cfg.eastern)
+    df.index = idx
+
+    df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"},
+              inplace=True)
+    needed=["open","high","low","close","volume"]
+    if not all(c in df.columns for c in needed):
+        missing=set(needed)-set(df.columns)
+        raise KeyError(f"{sym} missing {missing}")
+    return df[needed].copy()
+
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["ret"]   = df["close"].pct_change()
+    df["sma5"]  = df["close"].rolling(5).mean()
+    df["sma10"] = df["close"].rolling(10).mean()
+    d = df["close"].diff()
+    up,down = d.clip(lower=0), -d.clip(upper=0)
+    rs = up.rolling(14).mean()/down.rolling(14).mean()
+    df["rsi14"] = 100-100/(1+rs)
+    df.dropna(inplace=True)
+    df["target"]= (df["close"].shift(-1)>df["close"]).astype(int)
+    return df.dropna()
+
+def bs_delta_array(S,K,T,r,sigma,call_flags):
+    d1 = (np.log(S/K)+(r+0.5*sigma**2)*T)/(sigma*np.sqrt(T))
+    pdf=norm.cdf(d1)
+    return np.where(call_flags,pdf,pdf-1)
+
+@backoff.on_exception(backoff.expo, Exception, max_time=10, jitter=backoff.full_jitter)
+def get_last_quote(api: REST, symbol: str):
+    return api.get_last_quote(symbol)
+
+@backoff.on_exception(backoff.expo, Exception, max_time=10, jitter=backoff.full_jitter)
+def fetch_option_chain(api: REST, **kwargs):
+    return api.get_option_chain(**kwargs)
+
+# -----------------------------------------------------------------------------
+# BACKTESTER
+# -----------------------------------------------------------------------------
+class Backtester:
+    def __init__(self, api:REST, cfg:Config, lookback_days:int, test_size:float):
+        self.api = api
+        self.cfg = cfg
+        self.minutes = lookback_days*390
+        self.test_size = test_size
+
+    def simulate(self,sym:str)->pd.Series|None:
+        try:
+            bars = fetch_bars(self.api,sym,self.minutes,self.cfg)
+        except Exception as e:
+            logger.warning("Backtest skip %s: %s",sym,e)
+            return None
+
+        df=add_features(bars)
+        if len(df)<20:
+            logger.warning("%s: too little data",sym)
+            return None
+
+        X=df[self.cfg.features]
+        y=df["target"]
+        Xtr,Xte,ytr,yte = train_test_split(
+            X,y,test_size=self.test_size,shuffle=False
+        )
+        mdl=RandomForestClassifier(**self.cfg.model_params)
+        mdl.fit(Xtr,ytr)
+
+        S0=df.loc[Xte.index,"close"].to_numpy()
+        S1=df["close"].shift(-1).loc[Xte.index].to_numpy()
+        flags=mdl.predict(Xte).astype(bool)
+        deltas=bs_delta_array(S0,S0,1/252,self.cfg.r,self.cfg.sigma,flags)
+        pnl=deltas*((S1-S0)/S0)
+
+        mask=~np.isnan(pnl)
+        return pd.Series(pnl[mask],index=Xte.index[mask]).sort_index()
+
+    def run_all(self,workers:int,out_dir:str,start_capital:float):
+        os.makedirs(out_dir,exist_ok=True)
+        with ThreadPoolExecutor(max_workers=workers) as exe:
+            futs={exe.submit(self.simulate,s):s for s in self.cfg.symbols}
+            results={
+                futs[f]:res
+                for f,res in ((f,f.result()) for f in as_completed(futs))
+                if res is not None
+            }
+
+        if not results:
+            logger.error("No backtest data.")
+            return
+
+        df_pnl=pd.DataFrame(results).fillna(0)
+        port=df_pnl.sum(axis=1)
+        equity=start_capital + start_capital*port.cumsum()
+
+        # metrics
+        periods=252*390
+        mu=port.mean(); sigma=port.std()
+        ann_ret=mu*periods; ann_vol=sigma*np.sqrt(periods)
+        sharpe=ann_ret/ann_vol if ann_vol else np.nan
+        tot_ret=equity.iloc[-1]/start_capital-1
+        dd=equity/equity.cummax()-1; max_dd=dd.min()
+
+        metrics={
+            "start":start_capital,
+            "end":float(equity.iloc[-1]),
+            "total_return%":tot_ret*100,
+            "annual_return%":ann_ret*100,
+            "annual_vol%":ann_vol*100,
+            "sharpe":sharpe,
+            "max_drawdown%":max_dd*100
+        }
+        logger.info("Backtest metrics: %s",metrics)
+
+        df_pnl.to_csv(f"{out_dir}/pnl.csv")
+        fig,ax=plt.subplots(figsize=(10,5))
+        equity.plot(ax=ax,title="Equity Curve")
+        ax.set_ylabel("Equity ($)")
+        fig.tight_layout()
+        fig.savefig(f"{out_dir}/equity.png")
+        plt.show()
+
+        return metrics
+
+# -----------------------------------------------------------------------------
+# LIVE TRADER
+# -----------------------------------------------------------------------------
+class LiveTrader:
+    def __init__(self,api:REST,cfg:Config):
+        self.api=api; self.cfg=cfg
+        self.models={}
+        self.last_train=None
+        self.open_opts={}
+
+    def train_models(self):
+        logger.info("Training models on last %d minutes",self.cfg.lookback_min)
+        with ThreadPoolExecutor(max_workers=8) as exe:
+            futs={exe.submit(self._train_one,s):s for s in self.cfg.symbols}
+            for f in as_completed(futs):
+                sym,mdl=f.result()
+                if mdl: self.models[sym]=mdl
+        self.last_train=datetime.now(self.cfg.eastern)
+        logger.info("Trained %d models",len(self.models))
+
+    def _train_one(self,sym):
+        try:
+            bars=fetch_bars(self.api,sym,self.cfg.lookback_min,self.cfg)
+            df=add_features(bars)
+            X,y=df[self.cfg.features],df["target"]
+            Xtr,_,ytr,_=train_test_split(X,y,test_size=0.2,shuffle=False)
+            mdl=RandomForestClassifier(**self.cfg.model_params)
+            mdl.fit(Xtr,ytr)
+            return sym,mdl
+        except Exception as e:
+            logger.error("Train %s error: %s",sym,e)
+            return sym,None
+
+    def refresh_positions(self):
+        self.open_opts.clear()
+        for p in self.api.get_all_positions():
+            if p.asset_class=="option":
+                self.open_opts[p.symbol]=float(p.avg_entry_price)
+
+    def pick_atm(self,sym,dir_):
+        chain=fetch_option_chain(self.api,symbol=sym,expiry_days=7,limit=50)
+        spot=get_last_quote(self.api,sym).askprice
+        strike=min(chain.strikes,key=lambda k:abs(k-spot))
+        typ="call" if dir_ else "put"
+        leg=fetch_option_chain(
+            self.api,symbol=sym,expiry_days=7,strike=strike,option_type=typ
+        )
+        return min(leg,key=lambda o:o.expiration)
+
+    def run(self):
+        # handle CTRL+C
+        signal.signal(signal.SIGINT, lambda s,f:exit(0))
+        signal.signal(signal.SIGTERM, lambda s,f:exit(0))
+
+        logger.info("Waiting for market open...")
+        while not in_live_hours(self.cfg):
+            time.sleep(30)
+
+        self.train_models()
+        self.refresh_positions()
+        logger.info("Market open—live trading")
+
+        while in_live_hours(self.cfg):
+            now=datetime.now(self.cfg.eastern)
+            if (now-self.last_train)>timedelta(minutes=self.cfg.retrain_min):
+                self.train_models()
+
+            self.refresh_positions()
+            for sym,mdl in list(self.models.items()):
+                if sym in self.open_opts: continue
+                try:
+                    bars=fetch_bars(self.api,sym,self.cfg.lookback_min,self.cfg)
+                    df=add_features(bars)
+                    feat=df.iloc[[-1]][self.cfg.features]
+                    sig=mdl.predict(feat)[0]
+                    opt=self.pick_atm(sym,sig)
+                    logger.info("Placing %s %s",opt.symbol,"call" if sig else "put")
+                    self.api.submit_option_order(
+                        symbol=opt.symbol,qty=1,side="buy",
+                        type="market",time_in_force="day"
+                    )
+                    price=get_last_quote(self.api,opt.symbol).askprice
+                    self.open_opts[opt.symbol]=float(price)
+                except Exception as e:
+                    logger.error("Trade %s error: %s",sym,e)
+            time.sleep(60)
+
+        logger.info("Market closed—exiting live trader")
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+def main():
+    args=parse_args()
+    cfg=Config()
+    cfg.api_key=os.getenv("APCA_API_KEY_ID","")
+    cfg.api_secret=os.getenv("APCA_API_SECRET_KEY","")
+    if not (cfg.api_key and cfg.api_secret):
+        raise RuntimeError("Set APCA_API_KEY_ID & APCA_API_SECRET_KEY")
+
+    api=REST(cfg.api_key,cfg.api_secret,cfg.base_url,api_version="v2")
+
+    if args.mode=="backtest":
+        bt=Backtester(api,cfg,args.lookback_days,args.test_size)
+        metrics=bt.run_all(args.workers,args.out,args.start_capital)
+        print("\nMetrics:")
+        for k,v in metrics.items():
+            print(f"{k}: {v}")
+    else:
+        lt=LiveTrader(api,cfg)
+        lt.run()
+
+if __name__=="__main__":
+    main()
