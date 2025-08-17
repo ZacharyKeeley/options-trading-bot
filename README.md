@@ -3,7 +3,7 @@
 Modular Python bot for backtesting and running options strategies with broker‑agnostic execution.
 
 ## Install
-####bash
+###bash
 
 git clone https://github.com/ZacharyKeeley/options-trading-bot.git
 
